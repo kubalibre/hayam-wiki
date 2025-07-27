@@ -1,0 +1,36 @@
+version: '3.7'
+
+services:
+
+  api:
+    image: "registry.spryteam.io/rubai-api:master"
+    restart: "always"
+    environment:
+      DATABASE_HOST: "$PG_HOST"
+      DATABASE_PORT: "$PG_PORT"
+      DATABASE_NAME: "$PG_NAME"
+      DATABASE_USERNAME: "$PG_USER"
+      DATABASE_PASSWORD: "$PG_PASS"
+      JWT_SECRET: "$JWT_SIGN_SECRET"
+      DATA_DIR: "/data"
+    volumes:
+      - "data:/data"
+
+  front:
+    image: "registry.spryteam.io/rubai-front:master"
+    restart: "always"
+
+  router:
+    image: "registry.spryteam.io/rubai-router:master"
+    restart: "always"
+    links:
+      - "api:api"
+      - "front:front"
+    environment:
+      UPSTREAM_API: "http://api:3000"
+      UPSTREAM_API_WS: "http://api:3030"
+      UPSTREAM_API_DOCS: "http://api:3000"
+      UPSTREAM_FRONT: "http://front:80"
+
+volumes:
+  data:
