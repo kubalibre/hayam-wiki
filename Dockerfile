@@ -1,160 +1,257 @@
-# Dockerfile для полного hayam-wiki проекта
-# Основан на анализе docker-compose.yml, docker-compose.database.yml и docker-compose.override.yml
-# из репозитория https://github.com/kubalibre/hayam-wiki
-
-# Мультистейдж сборка для оптимизации размера образа
+# Dockerfile для развертывания Hayam Wiki на Fly.io
+# Оптимизированная single-container архитектура
 
 #==============================================================================
-# Стейдж 1: База данных PostgreSQL
+# Stage 1: API Server Build
 #==============================================================================
-FROM postgres:11-alpine as database
+FROM node:18-alpine AS api-builder
 
-# Переменные окружения из .env файла
-ENV POSTGRES_USER=omar
-ENV POSTGRES_PASSWORD=xM1rB9qXmbp89pad7Ypb
-ENV POSTGRES_DB=rubai
+WORKDIR /app/api
 
-# Устанавливаем часовой пояс
-RUN apk add --no-cache tzdata
-ENV TZ=UTC
-
-# Создаем структуру директорий
-RUN mkdir -p /var/lib/postgresql/data
-
-# Копируем данные PostgreSQL из репозитория (если доступны)
-# COPY hayam-wiki/data/postgres /var/lib/postgresql/data/
-
-# Устанавливаем права доступа
-RUN chown -R postgres:postgres /var/lib/postgresql/data
-
-# Добавляем метки для CI/CD
-LABEL ci.project.id="hayam"
-LABEL component="database"
-
-EXPOSE 5432
-
-#==============================================================================
-# Стейдж 2: API сервер (Node.js приложение)
-#==============================================================================
-FROM node:16-alpine as api
-
-WORKDIR /app
-
-# Устанавливаем системные зависимости
-RUN apk add --no-cache \
-    postgresql-client \
-    curl \
-    bash \
-    git
-
-# Копируем package.json (если есть в репозитории)
-# COPY package*.json ./
-# RUN npm install --production
-
-# Альтернативно - создаем базовую структуру для API
+# Устанавливаем зависимости для API
 RUN npm init -y && \
-    npm install express pg cors helmet morgan dotenv
+    npm install --production \
+        express \
+        pg \
+        cors \
+        helmet \
+        morgan \
+        dotenv \
+        ws \
+        jsonwebtoken \
+        bcrypt
 
-# Создаем базовую структуру API
-RUN mkdir -p src routes middleware
-
-# Создаем простой API сервер
-COPY <<EOF /app/src/server.js
+# Создаем API приложение
+COPY <<EOF /app/api/server.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
 
-// Middleware
-app.use(helmet());
-app.use(cors());
-app.use(morgan('combined'));
-app.use(express.json());
-
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', service: 'hayam-wiki-api' });
+// Database connection
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// API routes
+// Middleware
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrc: ["'self'"],
+            imgSrc: ["'self'", "data:", "https:"],
+        },
+    },
+}));
+
+app.use(cors({
+    origin: process.env.CORS_ORIGINS?.split(',') || ['https://hayam-wiki.fly.dev'],
+    credentials: true
+}));
+
+app.use(morgan('combined'));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Health check для Fly.io
+app.get('/health', async (req, res) => {
+    try {
+        await pool.query('SELECT 1');
+        res.json({ 
+            status: 'OK', 
+            service: 'hayam-wiki-api',
+            timestamp: new Date().toISOString(),
+            database: 'connected'
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            status: 'ERROR', 
+            service: 'hayam-wiki-api',
+            error: error.message 
+        });
+    }
+});
+
+// API Routes
 app.get('/api/v1/status', (req, res) => {
     res.json({ 
         status: 'running',
-        database: process.env.DATABASE_HOST,
-        version: '1.0.0'
+        version: '1.0.0',
+        domain: process.env.SITE_DOMAIN || 'hayam-wiki.fly.dev'
     });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
+// Pages API
+app.get('/api/v1/pages', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT id, title, slug, summary, view_count, created_at FROM hayam.pages WHERE status = $1 ORDER BY created_at DESC LIMIT 50',
+            ['published']
+        );
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/v1/pages/:slug', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM hayam.pages WHERE slug = $1 AND status = $2',
+            [req.params.slug, 'published']
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Page not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Categories API
+app.get('/api/v1/categories', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM hayam.categories ORDER BY name'
+        );
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+const PORT = process.env.API_PORT || 3000;
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(\`Hayam Wiki API server running on port \${PORT}\`);
 });
+
+// Graceful shutdown для Fly.io
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    server.close(() => {
+        console.log('Process terminated');
+        process.exit(0);
+    });
+});
+
+module.exports = app;
 EOF
 
-# Переменные окружения для API
-ENV DATABASE_HOST=db
-ENV DATABASE_PORT=5432
-ENV DATABASE_NAME=rubai
-ENV DATABASE_USERNAME=omar
-ENV DATABASE_PASSWORD=xM1rB9qXmbp89pad7Ypb
-ENV JWT_SECRET=secret
-ENV DATA_DIR=/data
-ENV PORT=3000
-
-# Создаем директорию для данных
-RUN mkdir -p /data
-VOLUME ["/data"]
-
-# Создаем пользователя для безопасности
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001
-
-RUN chown -R nodejs:nodejs /app /data
-USER nodejs
-
-LABEL ci.project.id="hayam"
-LABEL component="api"
-
-EXPOSE 3000 3030
-
-CMD ["node", "src/server.js"]
-
+#==============================================================================  
+# Stage 2: Frontend Build
 #==============================================================================
-# Стейдж 3: Frontend (React/Vue.js приложение)
-#==============================================================================
-FROM node:16-alpine as frontend-builder
+FROM node:18-alpine AS frontend-builder
 
-WORKDIR /app
+WORKDIR /app/frontend
 
-# Устанавливаем зависимости для сборки frontend
-RUN npm install -g @vue/cli create-react-app
+# Создаем React приложение
+RUN npx create-react-app hayam-wiki --template typescript
+WORKDIR /app/frontend/hayam-wiki
 
-# Создаем базовое приложение (React)
-RUN npx create-react-app hayam-wiki-frontend
-WORKDIR /app/hayam-wiki-frontend
-
-# Создаем базовую структуру для hayam-wiki
-COPY <<EOF /app/hayam-wiki-frontend/src/App.js
-import React from 'react';
+# Создаем компоненты для Hayam Wiki
+COPY <<EOF /app/frontend/hayam-wiki/src/App.tsx
+import React, { useState, useEffect } from 'react';
 import './App.css';
 
+interface Page {
+  id: number;
+  title: string;
+  slug: string;
+  summary: string;
+  view_count: number;
+  created_at: string;
+}
+
+interface Category {
+  id: number;
+  name: string;
+  slug: string;
+  description: string;
+}
+
 function App() {
+  const [pages, setPages] = useState<Page[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const [pagesRes, categoriesRes] = await Promise.all([
+          fetch('/api/v1/pages'),
+          fetch('/api/v1/categories')
+        ]);
+        
+        const pagesData = await pagesRes.json();
+        const categoriesData = await categoriesRes.json();
+        
+        setPages(pagesData);
+        setCategories(categoriesData);
+      } catch (error) {
+        console.error('Error fetching data:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, []);
+
+  if (loading) {
+    return <div className="loading">جاري التحميل...</div>;
+  }
+
   return (
     <div className="App">
       <header className="App-header">
         <h1>حيام ويكي - Hayam Wiki</h1>
         <p>الموسوعة العربية المفتوحة</p>
         <p>Open Arabic Encyclopedia</p>
+        <div className="domain-info">
+          <span>🌐 hayam-wiki.fly.dev</span>
+        </div>
       </header>
-      <main>
-        <section>
-          <h2>مرحباً بكم في حيام ويكي</h2>
-          <p>مشروع موسوعة عربية مفتوحة المصدر</p>
+      
+      <main className="main-content">
+        <section className="categories-section">
+          <h2>التصنيفات - Categories</h2>
+          <div className="categories-grid">
+            {categories.map(category => (
+              <div key={category.id} className="category-card">
+                <h3>{category.name}</h3>
+                <p>{category.description}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="pages-section">
+          <h2>المقالات الحديثة - Recent Articles</h2>
+          <div className="pages-list">
+            {pages.map(page => (
+              <article key={page.id} className="page-card">
+                <h3>{page.title}</h3>
+                <p>{page.summary}</p>
+                <div className="page-meta">
+                  <span>👁️ {page.view_count}</span>
+                  <span>📅 {new Date(page.created_at).toLocaleDateString('ar-SA')}</span>
+                </div>
+              </article>
+            ))}
+          </div>
         </section>
       </main>
+      
+      <footer className="footer">
+        <p>© 2025 Hayam Wiki - Powered by Fly.io</p>
+      </footer>
     </div>
   );
 }
@@ -162,203 +259,314 @@ function App() {
 export default App;
 EOF
 
-COPY <<EOF /app/hayam-wiki-frontend/src/App.css
+COPY <<EOF /app/frontend/hayam-wiki/src/App.css
 .App {
-  text-align: center;
-  font-family: 'Arial', sans-serif;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
 }
 
 .App-header {
-  background-color: #2c3e50;
-  padding: 20px;
+  background: linear-gradient(135deg, #2c3e50, #3498db);
   color: white;
+  padding: 40px 20px;
+  text-align: center;
+  border-radius: 10px;
+  margin: 20px 0;
 }
 
 .App-header h1 {
-  margin: 0;
+  margin: 0 0 10px 0;
   font-size: 2.5rem;
+  font-weight: bold;
 }
 
-main {
-  padding: 40px 20px;
-  direction: rtl;
+.domain-info {
+  background: rgba(255,255,255,0.1);
+  padding: 10px 20px;
+  border-radius: 20px;
+  margin-top: 20px;
+  display: inline-block;
 }
 
-main h2 {
+.loading {
+  text-align: center;
+  padding: 100px 20px;
+  font-size: 1.5rem;
   color: #2c3e50;
-  margin-bottom: 20px;
+}
+
+.main-content {
+  padding: 20px 0;
+}
+
+.categories-section, .pages-section {
+  margin: 40px 0;
+}
+
+.categories-section h2, .pages-section h2 {
+  color: #2c3e50;
+  border-bottom: 3px solid #3498db;
+  padding-bottom: 10px;
+  margin-bottom: 30px;
+}
+
+.categories-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 20px;
+  margin-bottom: 40px;
+}
+
+.category-card {
+  background: #f8f9fa;
+  border: 1px solid #e9ecef;
+  border-radius: 10px;
+  padding: 20px;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.category-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+.category-card h3 {
+  color: #2c3e50;
+  margin: 0 0 10px 0;
+}
+
+.pages-list {
+  display: grid;
+  gap: 20px;
+}
+
+.page-card {
+  background: white;
+  border: 1px solid #e9ecef;
+  border-radius: 10px;
+  padding: 25px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.page-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+}
+
+.page-card h3 {
+  color: #2c3e50;
+  margin: 0 0 15px 0;
+  font-size: 1.4rem;
+}
+
+.page-meta {
+  display: flex;
+  gap: 20px;
+  margin-top: 15px;
+  color: #6c757d;
+  font-size: 0.9rem;
+}
+
+.footer {
+  background: #2c3e50;
+  color: white;
+  text-align: center;
+  padding: 30px 20px;
+  margin-top: 60px;
+  border-radius: 10px;
+}
+
+/* RTL Support */
+[dir="rtl"] {
+  text-align: right;
+}
+
+@media (max-width: 768px) {
+  .App-header h1 {
+    font-size: 2rem;
+  }
+  
+  .categories-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .page-meta {
+    flex-direction: column;
+    gap: 10px;
+  }
 }
 EOF
 
-# Собираем приложение
+# Обновляем package.json
+RUN npm install --save-dev @types/react @types/react-dom
+
+# Собираем React приложение  
 RUN npm run build
 
 #==============================================================================
-# Стейдж 4: Frontend production (Nginx)
+# Stage 3: Production (Nginx + Node.js)
 #==============================================================================
-FROM nginx:alpine as frontend
+FROM nginx:alpine
 
-# Копируем собранное приложение
-COPY --from=frontend-builder /app/hayam-wiki-frontend/build /usr/share/nginx/html
+# Устанавливаем Node.js в Nginx контейнер
+RUN apk add --no-cache nodejs npm curl supervisor
 
-# Копируем конфигурацию nginx
-COPY <<EOF /etc/nginx/conf.d/default.conf
-server {
-    listen 80;
-    server_name _;
-    
-    root /usr/share/nginx/html;
-    index index.html index.htm;
+# Создаем директории
+RUN mkdir -p /app/api /app/logs /etc/supervisor/conf.d
 
-    # SPA роутинг
-    location / {
-        try_files \$uri \$uri/ /index.html;
+# Копируем API сервер
+COPY --from=api-builder /app/api /app/api
+
+# Копируем собранный frontend
+COPY --from=frontend-builder /app/frontend/hayam-wiki/build /usr/share/nginx/html
+
+# Конфигурация Nginx для Fly.io
+COPY <<EOF /etc/nginx/nginx.conf
+user nginx;
+worker_processes 1;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                    '\$status \$body_bytes_sent "\$http_referer" '
+                    '"\$http_user_agent" "\$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss application/atom+xml image/svg+xml;
+
+    upstream api {
+        server 127.0.0.1:3000;
     }
 
-    # Кеширование статических файлов
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)\$ {
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
+    server {
+        listen \${PORT:-8080};
+        server_name hayam-wiki.fly.dev _;
+        
+        root /usr/share/nginx/html;
+        index index.html index.htm;
 
-    # Безопасность
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+        # API proxy
+        location /api/ {
+            proxy_pass http://api/;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-Host \$host;
+        }
+
+        # Health check
+        location /health {
+            proxy_pass http://api/health;
+            access_log off;
+        }
+
+        # Static files
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)\$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # SPA routing
+        location / {
+            try_files \$uri \$uri/ /index.html;
+        }
+    }
 }
 EOF
 
-LABEL ci.project.id="hayam"
-LABEL component="frontend"
+# Supervisor конфигурация для запуска Nginx + Node.js
+COPY <<EOF /etc/supervisor/conf.d/supervisord.conf
+[supervisord]
+nodaemon=true
+user=root
+logfile=/app/logs/supervisord.log
+pidfile=/var/run/supervisord.pid
 
-EXPOSE 80
+[program:nginx]
+command=nginx -g "daemon off;"
+stdout_logfile=/app/logs/nginx-stdout.log
+stderr_logfile=/app/logs/nginx-stderr.log
+autorestart=true
+priority=1
 
-#==============================================================================
-# Стейдж 5: Router/Proxy (Nginx с проксированием)
-#==============================================================================
-FROM nginx:alpine as router
-
-# Устанавливаем дополнительные пакеты
-RUN apk add --no-cache \
-    curl \
-    bash \
-    openssl
-
-# Конфигурация nginx для роутинга
-COPY <<EOF /etc/nginx/conf.d/default.conf
-upstream api {
-    server api:3000;
-}
-
-upstream api_ws {
-    server api:3030;
-}
-
-upstream frontend {
-    server front:80;
-}
-
-server {
-    listen 80;
-    server_name hayamwiki.org _;
-
-    # Frontend
-    location / {
-        proxy_pass http://frontend;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    # API
-    location /api/ {
-        proxy_pass http://api/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    # WebSocket
-    location /ws/ {
-        proxy_pass http://api_ws/;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    # Health check
-    location /health {
-        proxy_pass http://api/health;
-    }
-}
+[program:api]
+command=node /app/api/server.js
+directory=/app/api
+stdout_logfile=/app/logs/api-stdout.log
+stderr_logfile=/app/logs/api-stderr.log
+autorestart=true
+priority=2
+environment=NODE_ENV=production,PORT=3000
 EOF
+
+# Entrypoint скрипт для Fly.io
+COPY <<EOF /app/fly-entrypoint.sh
+#!/bin/sh
+
+# Заменяем переменные в nginx.conf
+envsubst '\$PORT' < /etc/nginx/nginx.conf > /tmp/nginx.conf
+cp /tmp/nginx.conf /etc/nginx/nginx.conf
+
+# Запускаем supervisor
+exec supervisord -c /etc/supervisor/conf.d/supervisord.conf
+EOF
+
+RUN chmod +x /app/fly-entrypoint.sh
 
 # Переменные окружения
-ENV UPSTREAM_API=http://api:3000
-ENV UPSTREAM_API_WS=http://api:3030
-ENV UPSTREAM_FRONT=http://front:80
-ENV VIRTUAL_HOST=https://hayam-wiki.fly.dev/
-ENV VIRTUAL_PORT=80
-ENV LETSENCRYPT_HOST=hayamwiki.org
-ENV LETSENCRYPT_EMAIL=spryteamio@gmail.com
+ENV NODE_ENV=production
+ENV PORT=8080
+ENV API_PORT=3000
+ENV SITE_DOMAIN=hayam-wiki.fly.dev
+ENV CORS_ORIGINS=https://hayam-wiki.fly.dev
 
-LABEL ci.project.id="hayam"
-LABEL component="router"
+# Создаем пользователя для безопасности
+RUN addgroup -g 1001 -S appuser && \
+    adduser -S appuser -u 1001 -G appuser
 
-EXPOSE 80
+# Устанавливаем права
+RUN chown -R appuser:appuser /app /usr/share/nginx/html /var/log/nginx /var/cache/nginx /var/run
 
-#==============================================================================
-# Финальный стейдж - выбор компонента через build argument
-#==============================================================================
-FROM database as final-database
-FROM api as final-api  
-FROM frontend as final-frontend
-FROM router as final-router
+# Health check для Fly.io
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:$PORT/health || exit 1
 
-# По умолчанию собираем полный стек (можно переопределить через --target)
-FROM router as final
-
-# Метаданные образа
+# Метаданные
 LABEL maintainer="omar@hayamwiki.org"
-LABEL version="1.0.0"
-LABEL description="Hayam Wiki - Open Arabic Encyclopedia"
-LABEL org.opencontainers.image.source="https://github.com/kubalibre/hayam-wiki"
-LABEL org.opencontainers.image.documentation="https://hayamwiki.org/docs"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL version="1.0.0-fly"
+LABEL description="Hayam Wiki - Fly.io Deployment"
+LABEL fly.app="hayam-wiki"
 
-# Инструкции по использованию
-COPY <<EOF /README.md
-# Hayam Wiki Docker Image
+EXPOSE 8080
 
-Этот образ содержит полный стек приложения Hayam Wiki.
+USER appuser
 
-## Использование:
-
-### Сборка отдельных компонентов:
-- База данных: docker build --target database -t hayam-wiki:db .
-- API: docker build --target api -t hayam-wiki:api .
-- Frontend: docker build --target frontend -t hayam-wiki:front .
-- Router: docker build --target router -t hayam-wiki:router .
-
-### Запуск с docker-compose:
-docker-compose -f docker-compose.hayam-example.yml up -d
-
-### Переменные окружения:
-- PG_USER=omar
-- PG_PASS=xM1rB9qXmbp89pad7Ypb  
-- PG_NAME=rubai
-- JWT_SIGN_SECRET=secret
-- CI_PROJECT_ID=hayam
-- DOCKER_FRONT_PROXY_NETWORK=nginx-proxy
-
-### Порты:
-- 80: Frontend/Router
-- 3000: API HTTP
-- 3030: API WebSocket
-- 5432: PostgreSQL (внутренний)
-
-### Домен: hayamwiki.org
-EOF
+CMD ["/app/fly-entrypoint.sh"]
