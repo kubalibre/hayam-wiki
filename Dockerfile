@@ -300,7 +300,7 @@ EOF
 ENV UPSTREAM_API=http://api:3000
 ENV UPSTREAM_API_WS=http://api:3030
 ENV UPSTREAM_FRONT=http://front:80
-ENV VIRTUAL_HOST=hayamwiki.org
+ENV VIRTUAL_HOST=https://hayam-wiki.fly.dev/
 ENV VIRTUAL_PORT=80
 ENV LETSENCRYPT_HOST=hayamwiki.org
 ENV LETSENCRYPT_EMAIL=spryteamio@gmail.com
